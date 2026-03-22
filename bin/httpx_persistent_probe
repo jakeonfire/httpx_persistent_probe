@@ -1,0 +1,1444 @@
+#!/usr/bin/env ruby
+
+require "async"
+require "async/task"
+require "digest"
+require "httpx"
+require "httpx/plugins/persistent"
+require "json"
+require "optparse"
+require "securerandom"
+require "set"
+require "socket"
+require "stringio"
+require "time"
+require "uri"
+require "webrick"
+require "zlib"
+
+class HttpxPersistentProbe
+  DEFAULT_CASES = %w[
+    email
+    facebook
+    group_location
+    instagram
+    soundcloud
+    weather
+  ].freeze
+  DEFAULT_ITERATIONS = 5
+  RESPONSE_PREFIX_LENGTH = 200
+  ERROR_SAMPLE_LIMIT = 5
+  ERROR_REQUEST_SAMPLE_LIMIT = 3
+  REQUEST_TEMPLATES = [
+    {
+      name: "probe_template_a"
+    },
+    {
+      name: "probe_template_b"
+    },
+    {
+      name: "probe_template_c"
+    }
+  ].freeze
+  PROFILE_DEFAULTS = {
+    baseline: {},
+    pool10: {
+      worker_limit: 10
+    },
+    cpu_pool10: {
+      worker_limit: 10,
+      cpu_burn_ms: [10, 40],
+      response_padding_bytes: 8_192
+    },
+    large_pool10: {
+      worker_limit: 10,
+      response_padding_bytes: 65_536
+    },
+    stream_pool10: {
+      worker_limit: 10,
+      chunk_count: 4,
+      first_byte_delay_ms: [5, 20],
+      inter_chunk_delay_ms: [5, 20]
+    },
+    cpu_stream_pool10: {
+      worker_limit: 10,
+      cpu_burn_ms: [10, 40],
+      response_padding_bytes: 8_192,
+      chunk_count: 4,
+      first_byte_delay_ms: [5, 20],
+      inter_chunk_delay_ms: [5, 20]
+    },
+    cpu_stream_pool10_gzip: {
+      worker_limit: 10,
+      cpu_burn_ms: [10, 40],
+      response_padding_bytes: 8_192,
+      chunk_count: 4,
+      first_byte_delay_ms: [5, 20],
+      inter_chunk_delay_ms: [5, 20],
+      gzip: true
+    },
+    cpu_stream_pool10_close: {
+      worker_limit: 10,
+      cpu_burn_ms: [10, 40],
+      response_padding_bytes: 8_192,
+      chunk_count: 4,
+      first_byte_delay_ms: [5, 20],
+      inter_chunk_delay_ms: [5, 20],
+      close_connection_rate: 0.05
+    }
+  }.freeze
+  BASE_OPTION_DEFAULTS = {
+    worker_limit: 0,
+    cpu_burn_ms: [0, 0],
+    response_padding_bytes: 0,
+    chunk_count: 1,
+    first_byte_delay_ms: [0, 0],
+    inter_chunk_delay_ms: [0, 0],
+    client_burst_size: 0,
+    client_burst_gap_ms: [0, 0],
+    gzip: false,
+    close_connection_rate: 0.0,
+    cohort_size: 0,
+    cohort_release_delay_ms: [0, 0]
+  }.freeze
+
+  class ProbeError < StandardError; end
+
+  def initialize(argv, stdout: $stdout, stderr: $stderr)
+    @stdout = stdout
+    @stderr = stderr
+    @script_run_id = SecureRandom.uuid
+    @server_metrics_mutex = Mutex.new
+    @server_request_id_mutex = Mutex.new
+    @cohort_mutex = Mutex.new
+    @cohort_condition = ConditionVariable.new
+    @server_connection_ids = Set.new
+    @server_worker_slots = Set.new
+    @server_probe_request_counts = Hash.new(0)
+    @server_probe_request_connections = Hash.new { |hash, key| hash[key] = Set.new }
+    @server_request_id_sequence = 0
+    @cohort_waiting = 0
+    @cohort_generation = 0
+    @cohort_probe_arrivals = 0
+    @explicit_options = Set.new
+    @options = {
+      cases: DEFAULT_CASES.dup,
+      repeat: 1,
+      iterations: DEFAULT_ITERATIONS,
+      jsonl: nil,
+      httpx_debug_log: nil,
+      httpx_debug_level: 1,
+      profile: :baseline,
+      worker_limit: nil,
+      cpu_burn_ms: nil,
+      response_padding_bytes: nil,
+      chunk_count: nil,
+      first_byte_delay_ms: nil,
+      inter_chunk_delay_ms: nil,
+      client_burst_size: nil,
+      client_burst_gap_ms: nil,
+      gzip: nil,
+      close_connection_rate: nil,
+      cohort_size: nil,
+      cohort_release_delay_ms: nil
+    }
+
+    parse_options(argv)
+    apply_profile_defaults!
+    validate_options!
+    @probe_request_total = REQUEST_TEMPLATES.size * @options[:cases].size * @options[:iterations]
+    @jsonl_io = nil
+    @current_jsonl_path = nil
+    @httpx_debug_io = nil
+    @current_httpx_debug_log_path = nil
+  end
+
+  def run
+    start_local_server
+
+    run_summaries = []
+
+    1.upto(@options[:repeat]) do |run_index|
+      @current_run_index = run_index
+      @current_run_id = "#{@script_run_id}:run-#{run_index}"
+      reset_server_metrics!
+      open_run_output(run_index)
+      start_event_writer
+
+      baseline_session = build_session(persistent: false)
+      probe_session = build_session(persistent: true)
+
+      baseline_results, baseline_errors = collect_baseline(baseline_session)
+      summary =
+        if baseline_errors.any?
+          finish!(
+            baseline_errors:,
+            baseline_results:,
+            probe_errors: [],
+            probe_results: [],
+            exit_code: 1
+          )
+        else
+          probe_results, probe_errors = run_probe(probe_session, baseline_results)
+
+          finish!(
+            baseline_errors:,
+            baseline_results:,
+            probe_errors:,
+            probe_results:,
+            exit_code: nil
+          )
+        end
+
+      run_summaries << summary
+    ensure
+      stop_event_writer
+      close_run_output
+    end
+
+    if @options[:repeat] > 1
+      aggregate = aggregate_summary_payload(run_summaries)
+      print_aggregate_summary(aggregate)
+      aggregate[:exit_code]
+    else
+      run_summaries.last[:exit_code]
+    end
+  ensure
+    stop_local_server
+    stop_event_writer
+    close_run_output
+  end
+
+  private
+
+  def parse_options(argv)
+    parser = OptionParser.new do |opts|
+      opts.banner = "Usage: bin/httpx_persistent_probe [options]"
+
+      opts.on("--profile NAME", String, "Stress profile (default: baseline)") do |profile|
+        mark_explicit(:profile)
+        @options[:profile] = profile.to_sym
+      end
+
+      opts.on("--cases a,b,c", Array, "Comma-separated list of case names") do |cases|
+        mark_explicit(:cases)
+        @options[:cases] = cases.map(&:strip).reject(&:empty?)
+      end
+
+      opts.on("--repeat N", Integer, "Run the entire probe N times in sequence (default: 1)") do |repeat|
+        mark_explicit(:repeat)
+        @options[:repeat] = repeat
+      end
+
+      opts.on("--iterations N", Integer, "Number of probe iterations per request template/case pair (default: #{DEFAULT_ITERATIONS})") do |iterations|
+        mark_explicit(:iterations)
+        @options[:iterations] = iterations
+      end
+
+      opts.on("--worker-limit N", Integer, "Limit concurrent server handlers (0 disables the cap)") do |worker_limit|
+        mark_explicit(:worker_limit)
+        @options[:worker_limit] = worker_limit
+      end
+
+      opts.on("--cpu-burn-ms MIN:MAX", String, "CPU burn range in milliseconds per response") do |range|
+        mark_explicit(:cpu_burn_ms)
+        @options[:cpu_burn_ms] = parse_ms_range(range, option_name: "--cpu-burn-ms")
+      end
+
+      opts.on("--response-padding-bytes N", Integer, "Deterministic response padding bytes") do |bytes|
+        mark_explicit(:response_padding_bytes)
+        @options[:response_padding_bytes] = bytes
+      end
+
+      opts.on("--chunk-count N", Integer, "Number of response body chunks to stream") do |chunk_count|
+        mark_explicit(:chunk_count)
+        @options[:chunk_count] = chunk_count
+      end
+
+      opts.on("--first-byte-delay-ms MIN:MAX", String, "Delay before the first response byte in milliseconds") do |range|
+        mark_explicit(:first_byte_delay_ms)
+        @options[:first_byte_delay_ms] = parse_ms_range(range, option_name: "--first-byte-delay-ms")
+      end
+
+      opts.on("--inter-chunk-delay-ms MIN:MAX", String, "Delay between streamed chunks in milliseconds") do |range|
+        mark_explicit(:inter_chunk_delay_ms)
+        @options[:inter_chunk_delay_ms] = parse_ms_range(range, option_name: "--inter-chunk-delay-ms")
+      end
+
+      opts.on("--client-burst-size N", Integer, "Launch probe requests in bursts of N concurrent fibers (0 launches all at once)") do |client_burst_size|
+        mark_explicit(:client_burst_size)
+        @options[:client_burst_size] = client_burst_size
+      end
+
+      opts.on("--client-burst-gap-ms MIN:MAX", String, "Delay between client-side probe bursts in milliseconds") do |range|
+        mark_explicit(:client_burst_gap_ms)
+        @options[:client_burst_gap_ms] = parse_ms_range(range, option_name: "--client-burst-gap-ms")
+      end
+
+      opts.on("--[no-]gzip", "Enable gzip responses when the client allows them") do |gzip|
+        mark_explicit(:gzip)
+        @options[:gzip] = gzip
+      end
+
+      opts.on("--close-connection-rate FLOAT", Float, "Fraction of responses that close the keep-alive connection") do |rate|
+        mark_explicit(:close_connection_rate)
+        @options[:close_connection_rate] = rate
+      end
+
+      opts.on("--cohort-size N", Integer, "Hold probe requests until N are waiting before releasing them") do |cohort_size|
+        mark_explicit(:cohort_size)
+        @options[:cohort_size] = cohort_size
+      end
+
+      opts.on("--cohort-release-delay-ms MIN:MAX", String, "Delay the release of each cohort in milliseconds") do |range|
+        mark_explicit(:cohort_release_delay_ms)
+        @options[:cohort_release_delay_ms] = parse_ms_range(range, option_name: "--cohort-release-delay-ms")
+      end
+
+      opts.on("--jsonl PATH", String, "Write JSONL events to PATH instead of stdout") do |path|
+        @options[:jsonl] = path
+      end
+
+      opts.on("--httpx-debug-log PATH", String, "Write HTTPX debug output to PATH") do |path|
+        @options[:httpx_debug_log] = path
+      end
+
+      opts.on("--httpx-debug-level N", Integer, "Set HTTPX debug_level (default: 1)") do |level|
+        @options[:httpx_debug_level] = level
+      end
+
+      opts.on("-h", "--help", "Show this help") do
+        @stdout.puts(opts)
+        exit(0)
+      end
+    end
+
+    parser.parse!(argv)
+  rescue OptionParser::ParseError => e
+    @stderr.puts(e.message)
+    @stderr.puts(parser)
+    exit(2)
+  end
+
+  def mark_explicit(key)
+    @explicit_options << key
+  end
+
+  def parse_ms_range(value, option_name:)
+    min_ms, max_ms = value.to_s.split(":", 2)
+    raise OptionParser::InvalidArgument, "#{option_name} must be formatted like MIN:MAX" if max_ms.nil?
+
+    [Integer(min_ms, 10), Integer(max_ms, 10)]
+  rescue ArgumentError
+    raise OptionParser::InvalidArgument, "#{option_name} must be formatted like MIN:MAX"
+  end
+
+  def apply_profile_defaults!
+    profile_defaults = PROFILE_DEFAULTS.fetch(@options[:profile]) do
+      raise OptionParser::InvalidArgument, "--profile must be one of #{PROFILE_DEFAULTS.keys.join(', ')}"
+    end
+
+    merged_defaults = BASE_OPTION_DEFAULTS.merge(profile_defaults)
+    merged_defaults.each do |key, value|
+      next if @explicit_options.include?(key)
+
+      @options[key] = duplicate_option_value(value)
+    end
+  end
+
+  def duplicate_option_value(value)
+    case value
+    when Array
+      value.dup
+    else
+      value
+    end
+  end
+
+  def validate_options!
+    raise OptionParser::InvalidArgument, "--cases must contain at least one case name" if @options[:cases].empty?
+    raise OptionParser::InvalidArgument, "--repeat must be greater than 0" unless @options[:repeat].positive?
+    raise OptionParser::InvalidArgument, "--iterations must be greater than 0" unless @options[:iterations].positive?
+    raise OptionParser::InvalidArgument, "--worker-limit must be 0 or greater" if @options[:worker_limit].negative?
+    raise OptionParser::InvalidArgument, "--response-padding-bytes must be 0 or greater" if @options[:response_padding_bytes].negative?
+    raise OptionParser::InvalidArgument, "--chunk-count must be greater than 0" unless @options[:chunk_count].positive?
+    raise OptionParser::InvalidArgument, "--client-burst-size must be 0 or greater" if @options[:client_burst_size].negative?
+    raise OptionParser::InvalidArgument, "--close-connection-rate must be between 0.0 and 1.0" unless @options[:close_connection_rate].between?(0.0, 1.0)
+    raise OptionParser::InvalidArgument, "--cohort-size must be 0 or greater" if @options[:cohort_size].negative?
+    raise OptionParser::InvalidArgument, "--httpx-debug-level must be 0 or greater" if @options[:httpx_debug_level].negative?
+
+    validate_ms_range!(@options[:cpu_burn_ms], option_name: "--cpu-burn-ms")
+    validate_ms_range!(@options[:first_byte_delay_ms], option_name: "--first-byte-delay-ms")
+    validate_ms_range!(@options[:inter_chunk_delay_ms], option_name: "--inter-chunk-delay-ms")
+    validate_ms_range!(@options[:client_burst_gap_ms], option_name: "--client-burst-gap-ms")
+    validate_ms_range!(@options[:cohort_release_delay_ms], option_name: "--cohort-release-delay-ms")
+  rescue OptionParser::ParseError => e
+    @stderr.puts(e.message)
+    exit(2)
+  end
+
+  def validate_ms_range!(range, option_name:)
+    min_ms, max_ms = range
+    raise OptionParser::InvalidArgument, "#{option_name} must be formatted like MIN:MAX" if min_ms.nil? || max_ms.nil?
+    raise OptionParser::InvalidArgument, "#{option_name} values must be 0 or greater" if min_ms.negative? || max_ms.negative?
+    raise OptionParser::InvalidArgument, "#{option_name} MIN must be less than or equal to MAX" if min_ms > max_ms
+  end
+
+  def start_local_server
+    port = find_available_port
+    @base_uri = URI("http://127.0.0.1:#{port}/")
+    @worker_slots = build_worker_slots(@options[:worker_limit])
+    @server = WEBrick::HTTPServer.new(
+      BindAddress: @base_uri.host,
+      Port: @base_uri.port,
+      Logger: WEBrick::Log.new(File::NULL),
+      AccessLog: []
+    )
+    @server.mount_proc("/") do |request, response|
+      handle_server_request(request, response)
+    end
+    @server_thread = Thread.new { @server.start }
+    wait_for_server!
+  end
+
+  def stop_local_server
+    return unless @server
+
+    @server.shutdown
+    @server_thread&.join(1)
+  ensure
+    @server = nil
+    @server_thread = nil
+    @worker_slots = nil
+  end
+
+  def build_worker_slots(worker_limit)
+    return nil if worker_limit.zero?
+
+    Queue.new.tap do |queue|
+      worker_limit.times do |index|
+        queue << "slot-#{index + 1}"
+      end
+    end
+  end
+
+  def find_available_port
+    TCPServer.open("127.0.0.1", 0) do |server|
+      server.addr[1]
+    end
+  end
+
+  def wait_for_server!
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+
+    loop do
+      TCPSocket.open(@base_uri.host, @base_uri.port, &:close)
+      return
+    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH
+      raise ProbeError, "Local WEBrick server failed to start" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      sleep(0.01)
+    end
+  end
+
+  def handle_server_request(request, response)
+    server_request_id = next_server_request_id
+    phase = request_header_value(request, "x-probe-phase") || "unknown"
+    request_label = request_header_value(request, "x-probe-request-label")
+    connection_id = connection_identifier(request)
+    worker_slot = acquire_worker_slot
+
+    wait_for_cohort_release(phase:)
+
+    request_body = JSON.parse(request.body.to_s)
+    cpu_burn_ms = sample_ms_range(@options[:cpu_burn_ms])
+    burn_cpu!(cpu_burn_ms, seed: normalized_request_digest(request_body))
+
+    response_payload = build_server_response_payload(request_body)
+    response_body = normalize_json(response_payload)
+    wire_body, content_encoding = encode_wire_body(response_body:, request:)
+    chunk_count = effective_chunk_count(wire_body)
+    first_byte_delay_ms = sample_ms_range(@options[:first_byte_delay_ms])
+    inter_chunk_delay_ms = sample_ms_range(@options[:inter_chunk_delay_ms])
+    close_connection = should_close_connection?
+
+    server_payload = {
+      event: "server_request_received",
+      phase:,
+      host: @base_uri.host,
+      request_label:,
+      server_request_id:,
+      server_connection_id: connection_id,
+      server_worker_slot: worker_slot,
+      server_profile: @options[:profile],
+      server_response_fingerprint: response_payload["response_fingerprint"],
+      server_response_sha256: Digest::SHA256.hexdigest(response_body),
+      server_response_bytes: response_body.bytesize,
+      server_wire_bytes: wire_body.bytesize,
+      server_chunk_count: chunk_count,
+      server_cpu_burn_ms: cpu_burn_ms,
+      server_first_byte_delay_ms: first_byte_delay_ms,
+      server_inter_chunk_delay_ms: inter_chunk_delay_ms,
+      server_closed_connection: close_connection
+    }
+    emit_server_event(server_payload)
+
+    response.status = 200
+    response["Content-Type"] = "application/json"
+    response["Content-Encoding"] = content_encoding if content_encoding
+
+    if close_connection
+      response.keep_alive = false
+      response["Connection"] = "close"
+    end
+
+    if chunk_count > 1
+      response.chunked = true
+      response.body = proc do |out|
+        emit_server_event(server_payload.merge(event: "server_response_started"))
+        sleep_ms(first_byte_delay_ms)
+
+        chunk_wire_body(wire_body, chunk_count).each_with_index do |chunk, index|
+          out.write(chunk)
+          next if index == chunk_count - 1
+
+          sleep_ms(inter_chunk_delay_ms)
+        end
+      ensure
+        emit_server_event(server_payload.merge(event: "server_response_finished"))
+      end
+    else
+      sleep_ms(first_byte_delay_ms)
+      emit_server_event(server_payload.merge(event: "server_response_started"))
+      response.body = wire_body
+      emit_server_event(server_payload.merge(event: "server_response_finished"))
+    end
+  rescue JSON::ParserError => e
+    response.status = 400
+    response["Content-Type"] = "application/json"
+    response.body = JSON.generate({
+      "error" => "invalid_json",
+      "message" => e.message
+    })
+  ensure
+    release_worker_slot(worker_slot)
+  end
+
+  def acquire_worker_slot
+    return "thread-#{Thread.current.object_id}" unless @worker_slots
+
+    @worker_slots.pop
+  end
+
+  def release_worker_slot(worker_slot)
+    return if worker_slot.nil? || !@worker_slots
+
+    @worker_slots << worker_slot
+  end
+
+  def wait_for_cohort_release(phase:)
+    return unless phase == "probe"
+    return unless @options[:cohort_size] > 1
+
+    @cohort_mutex.synchronize do
+      @cohort_probe_arrivals += 1
+      current_generation = @cohort_generation
+      @cohort_waiting += 1
+
+      release_now = @cohort_waiting >= @options[:cohort_size] || @cohort_probe_arrivals >= @probe_request_total
+      if release_now
+        sleep_ms(sample_ms_range(@options[:cohort_release_delay_ms]))
+        @cohort_generation += 1
+        @cohort_waiting = 0
+        @cohort_condition.broadcast
+      else
+        @cohort_condition.wait(@cohort_mutex) while current_generation == @cohort_generation
+      end
+    end
+  end
+
+  def next_server_request_id
+    @server_request_id_mutex.synchronize do
+      @server_request_id_sequence += 1
+    end
+  end
+
+  def request_header_value(request, header_name)
+    request.header[header_name]&.first
+  end
+
+  def connection_identifier(request)
+    peer = request.peeraddr
+    return "#{peer[3]}:#{peer[1]}" if peer
+  rescue StandardError
+    socket = request.instance_variable_get(:@socket)
+    io = socket.respond_to?(:io) ? socket.io : socket
+    "socket-#{io&.object_id || request.object_id}"
+  end
+
+  def build_server_response_payload(request_body)
+    request_digest = normalized_request_digest(request_body)
+    template_name = request_body.fetch("template_name")
+    case_name = request_body.fetch("case_name").to_s
+
+    {
+      "response_fingerprint" => response_fingerprint_for(request_body),
+      "request_digest" => request_digest,
+      "template_name" => template_name,
+      "case_name" => case_name,
+      "payload" => {
+        "segments" => deterministic_segments(request_digest),
+        "padding" => deterministic_padding(request_digest, @options[:response_padding_bytes])
+      }
+    }
+  end
+
+  def normalized_request_digest(request_body)
+    Digest::SHA256.hexdigest(normalize_json(request_body))
+  end
+
+  def response_fingerprint_for(request_body)
+    template_name = request_body.fetch("template_name")
+    case_name = request_body.fetch("case_name").to_s
+    request_digest = normalized_request_digest(request_body)
+    "#{template_name}:#{case_name}:#{request_digest[0, 12]}"
+  end
+
+  def deterministic_segments(request_digest)
+    6.times.map do |index|
+      offset = (index * 8) % request_digest.length
+      {
+        "index" => index,
+        "token" => request_digest[offset, 8],
+        "weight" => request_digest[offset, 2].to_i(16)
+      }
+    end
+  end
+
+  def deterministic_padding(request_digest, bytes)
+    return "" if bytes.zero?
+
+    (request_digest * ((bytes.to_f / request_digest.bytesize).ceil))
+      .byteslice(0, bytes)
+  end
+
+  def burn_cpu!(cpu_burn_ms, seed:)
+    return if cpu_burn_ms.zero?
+
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + (cpu_burn_ms / 1000.0)
+    digest = seed
+
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      digest = Digest::SHA256.hexdigest(digest)
+      digest.chars.each_slice(4).map { |slice| slice.join.to_i(16) }
+    end
+
+    digest
+  end
+
+  def encode_wire_body(response_body:, request:)
+    return [response_body, nil] unless @options[:gzip]
+    return [response_body, nil] unless request_header_value(request, "accept-encoding").to_s.include?("gzip")
+
+    io = StringIO.new
+    Zlib::GzipWriter.wrap(io) do |gzip|
+      gzip.write(response_body)
+    end
+
+    [io.string, "gzip"]
+  end
+
+  def effective_chunk_count(wire_body)
+    return 1 if @options[:chunk_count] <= 1
+    return 1 if wire_body.bytesize <= 1
+
+    [@options[:chunk_count], wire_body.bytesize].min
+  end
+
+  def chunk_wire_body(wire_body, chunk_count)
+    chunk_size = (wire_body.bytesize.to_f / chunk_count).ceil
+    chunks = []
+    offset = 0
+
+    while offset < wire_body.bytesize
+      chunks << wire_body.byteslice(offset, chunk_size)
+      offset += chunk_size
+    end
+
+    chunks
+  end
+
+  def should_close_connection?
+    return false if @options[:close_connection_rate].zero?
+
+    rand < @options[:close_connection_rate]
+  end
+
+  def sample_ms_range(range)
+    min_ms, max_ms = range
+    return min_ms if min_ms == max_ms
+
+    rand(min_ms..max_ms)
+  end
+
+  def sleep_ms(ms)
+    sleep(ms / 1000.0) if ms.positive?
+  end
+
+  def build_session(persistent:)
+    session = HTTPX.with(
+      origin: @base_uri.origin,
+      base_path: @base_uri.path,
+      headers: default_headers,
+      debug: @httpx_debug_io,
+      debug_level: @options[:httpx_debug_level]
+    )
+    session = session.plugin(:persistent) if persistent
+    session
+  end
+
+  def default_headers
+    headers = {
+      "accept" => "application/json"
+    }
+    headers["accept-encoding"] = "gzip" if @options[:gzip]
+    headers
+  end
+
+  def collect_baseline(session)
+    results = {}
+    errors = []
+
+    baseline_specs.each do |spec|
+      prepared = prepare_request(session:, phase: "baseline", **spec)
+      outcome = execute_request(prepared)
+
+      event = baseline_event_payload(outcome:, prepared:)
+      emit_event(event)
+
+      if outcome[:ok]
+        results[spec[:request_key]] = outcome.slice(
+          :normalized_response_sha256,
+          :normalized_response_prefix,
+          :normalized_response_body,
+          :response_fingerprint
+        )
+      else
+        errors << event
+      end
+    end
+
+    [results, errors]
+  end
+
+  def run_probe(session, baseline_results)
+    probe_results = []
+    probe_errors = []
+    specs = probe_specs
+
+    Async do |task|
+      burst_specs(specs).each_with_index do |burst, burst_index|
+        run_probe_burst(
+          baseline_results:,
+          burst:,
+          burst_index: burst_index + 1,
+          probe_errors:,
+          probe_results:,
+          session:,
+          task:
+        )
+
+        next if burst_index == burst_specs(specs).size - 1
+
+        sleep_ms(sample_ms_range(@options[:client_burst_gap_ms]))
+      end
+    end.wait
+
+    [probe_results, probe_errors]
+  end
+
+  def run_probe_burst(task:, session:, burst:, burst_index:, baseline_results:, probe_results:, probe_errors:)
+    ready = Thread::Queue.new
+    start_notification = Async::Notification.new
+    barrier = Async::Barrier.new(parent: task)
+
+    burst.each do |spec|
+      barrier.async do
+        prepared = prepare_request(
+          session:,
+          phase: "probe",
+          burst_index:,
+          burst_size: burst.size,
+          **spec
+        )
+        emit_event(probe_start_payload(prepared))
+        ready << true
+        start_notification.wait
+
+        outcome = execute_request(prepared)
+        event = probe_event_payload(
+          baseline_results:,
+          outcome:,
+          prepared:
+        )
+        emit_event(event)
+
+        if outcome[:ok]
+          probe_results << event
+        else
+          probe_errors << event
+        end
+      end
+    end
+
+    until ready.size == burst.size
+      sleep(0)
+    end
+
+    start_notification.signal
+    barrier.wait
+  end
+
+  def burst_specs(specs)
+    burst_size = @options[:client_burst_size]
+    return [specs] if burst_size.zero? || burst_size >= specs.size
+
+    specs.each_slice(burst_size).to_a
+  end
+
+  def finish!(baseline_errors:, baseline_results:, probe_errors:, probe_results:, exit_code:)
+    summary = summary_payload(
+      baseline_errors:,
+      baseline_results:,
+      probe_errors:,
+      probe_results:,
+      exit_code:
+    )
+
+    emit_event(summary)
+    print_summary(summary)
+
+    summary
+  end
+
+  def baseline_specs
+    REQUEST_TEMPLATES.product(@options[:cases]).map do |template, case_name|
+      {
+        request_key: request_key(template[:name], case_name),
+        case_name:,
+        request_template: template
+      }
+    end
+  end
+
+  def probe_specs
+    @options[:iterations].times.flat_map do |iteration|
+      REQUEST_TEMPLATES.flat_map do |template|
+        @options[:cases].map do |case_name|
+          {
+            request_key: request_key(template[:name], case_name),
+            iteration: iteration + 1,
+            case_name:,
+            request_template: template,
+            request_label: "#{template[:name]}:#{case_name}:#{iteration + 1}"
+          }
+        end
+      end
+    end
+  end
+
+  def request_key(template_name, case_name)
+    "#{template_name}:#{case_name}"
+  end
+
+  def metadata_headers(phase:, request_label:, request_key:, iteration:, burst_index:, burst_size:)
+    headers = {
+      "x-probe-phase" => phase,
+      "x-probe-request-label" => request_label,
+      "x-probe-request-key" => request_key
+    }
+    headers["x-probe-iteration"] = iteration.to_s if iteration
+    headers["x-probe-burst-index"] = burst_index.to_s if burst_index
+    headers["x-probe-burst-size"] = burst_size.to_s if burst_size
+    headers["x-probe-total-requests"] = @probe_request_total.to_s if phase == "probe"
+    headers
+  end
+
+  def prepare_request(session:, request_template:, case_name:, request_key:, phase:, request_label: nil, iteration: nil, burst_index: nil, burst_size: nil)
+    request_label ||= "baseline:#{request_key}"
+    request_body = {
+      template_name: request_template[:name],
+      case_name:
+    }
+    request = session.build_request(
+      "POST",
+      "",
+      json: request_body,
+      headers: metadata_headers(
+        phase:,
+        request_label:,
+        request_key:,
+        iteration:,
+        burst_index:,
+        burst_size:
+      )
+    )
+
+    {
+      request_key:,
+      burst_index:,
+      burst_size:,
+      host: request.uri.host,
+      iteration:,
+      case_name:,
+      phase:,
+      request_template: request_template[:name],
+      request:,
+      request_body: normalize_request_body(request_body),
+      request_label:,
+      session:
+    }
+  end
+
+  def normalize_request_body(request_body)
+    JSON.parse(JSON.generate(request_body))
+  end
+
+  def execute_request(prepared)
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    raw_response_body = nil
+    parsed_body = nil
+    raw_response = prepared[:session].request(prepared[:request])
+    raw_response.raise_for_status if raw_response.is_a?(HTTPX::ErrorResponse)
+    raw_response_body = raw_response.to_s
+
+    parsed_body = JSON.parse(raw_response_body)
+    validate_server_response!(
+      body: parsed_body,
+      expected_request_body: prepared[:request_body]
+    )
+
+    normalized_response_body = normalize_json(parsed_body)
+
+    {
+      duration_ms: elapsed_ms(started_at),
+      httpx_request_object_id: prepared[:request].object_id,
+      normalized_response_body:,
+      normalized_response_prefix: normalized_response_body[0, RESPONSE_PREFIX_LENGTH],
+      normalized_response_sha256: Digest::SHA256.hexdigest(normalized_response_body),
+      ok: true,
+      peer_address: raw_response.peer_address&.to_s,
+      response_fingerprint: parsed_body["response_fingerprint"],
+      status: raw_response.status
+    }
+  rescue StandardError => e
+    {
+      duration_ms: elapsed_ms(started_at),
+      error_class: e.class.name,
+      error_message: e.message,
+      error_response_body: serialize_error_response_body(parsed_body:, raw_response_body:),
+      httpx_request_object_id: prepared[:request].object_id,
+      ok: false
+    }
+  end
+
+  def validate_server_response!(body:, expected_request_body:)
+    response_fingerprint = body["response_fingerprint"]
+    request_digest = body["request_digest"]
+    raise ProbeError, "Unexpected probe payload: missing response_fingerprint" if response_fingerprint.to_s.empty?
+    raise ProbeError, "Unexpected probe payload: missing request_digest" if request_digest.to_s.empty?
+
+    expected_fingerprint = response_fingerprint_for(expected_request_body)
+    expected_request_digest = normalized_request_digest(expected_request_body)
+    raise ProbeError, "Response fingerprint did not match input" unless response_fingerprint == expected_fingerprint
+    raise ProbeError, "Response request_digest did not match input" unless request_digest == expected_request_digest
+  end
+
+  def normalize_json(value)
+    JSON.generate(deep_sort(value))
+  end
+
+  def deep_sort(value)
+    case value
+    when Hash
+      value.keys.sort_by(&:to_s).each_with_object({}) do |key, acc|
+        acc[key.to_s] = deep_sort(value[key])
+      end
+    when Array
+      value.map { |item| deep_sort(item) }
+    else
+      value
+    end
+  end
+
+  def baseline_event_payload(outcome:, prepared:)
+    task = current_async_task
+    {
+      event: "baseline_result",
+      phase: prepared[:phase],
+      host: prepared[:host],
+      session_object_id: prepared[:session].object_id,
+      async_task_object_id: task&.object_id,
+      async_task_fiber_object_id: task&.fiber&.object_id,
+      fiber_object_id: Fiber.current.object_id,
+      httpx_request_object_id: outcome[:httpx_request_object_id],
+      request_label: prepared[:request_label],
+      request_template: prepared[:request_template],
+      case_name: prepared[:case_name],
+      status: outcome[:status],
+      duration_ms: outcome[:duration_ms],
+      peer_address: outcome[:peer_address],
+      response_fingerprint: outcome[:response_fingerprint],
+      normalized_response_sha256: outcome[:normalized_response_sha256],
+      normalized_response_prefix: outcome[:normalized_response_prefix],
+      success: outcome[:ok],
+      error_class: outcome[:error_class],
+      error_message: outcome[:error_message],
+      error_response_body: outcome[:error_response_body]
+    }
+  end
+
+  def probe_start_payload(prepared)
+    task = current_async_task
+    {
+      event: "probe_start",
+      phase: prepared[:phase],
+      host: prepared[:host],
+      session_object_id: prepared[:session].object_id,
+      async_task_object_id: task&.object_id,
+      async_task_fiber_object_id: task&.fiber&.object_id,
+      fiber_object_id: Fiber.current.object_id,
+      httpx_request_object_id: prepared[:request].object_id,
+      request_label: prepared[:request_label],
+      request_template: prepared[:request_template],
+      case_name: prepared[:case_name],
+      iteration: prepared[:iteration],
+      burst_index: prepared[:burst_index],
+      burst_size: prepared[:burst_size]
+    }
+  end
+
+  def probe_event_payload(baseline_results:, outcome:, prepared:)
+    task = current_async_task
+    expected_fingerprint = response_fingerprint_for(prepared[:request_body])
+    payload = {
+      event: outcome[:ok] ? "probe_result" : "probe_error",
+      phase: prepared[:phase],
+      host: prepared[:host],
+      session_object_id: prepared[:session].object_id,
+      async_task_object_id: task&.object_id,
+      async_task_fiber_object_id: task&.fiber&.object_id,
+      fiber_object_id: Fiber.current.object_id,
+      httpx_request_object_id: outcome[:httpx_request_object_id],
+      request_label: prepared[:request_label],
+      request_template: prepared[:request_template],
+      case_name: prepared[:case_name],
+      iteration: prepared[:iteration],
+      burst_index: prepared[:burst_index],
+      burst_size: prepared[:burst_size],
+      duration_ms: outcome[:duration_ms],
+      status: outcome[:status],
+      peer_address: outcome[:peer_address],
+      response_fingerprint: outcome[:response_fingerprint],
+      expected_response_fingerprint: expected_fingerprint,
+      normalized_response_sha256: outcome[:normalized_response_sha256],
+      normalized_response_prefix: outcome[:normalized_response_prefix],
+      expected_request_key: prepared[:request_key],
+      error_class: outcome[:error_class],
+      error_message: outcome[:error_message],
+      error_response_body: outcome[:error_response_body]
+    }
+
+    return payload.merge(matches_baseline: false) unless outcome[:ok]
+
+    expected_sha = baseline_results.dig(prepared[:request_key], :normalized_response_sha256)
+    matched_request_key = baseline_results.find do |key, value|
+      next if key == prepared[:request_key]
+
+      value[:normalized_response_sha256] == outcome[:normalized_response_sha256]
+    end&.first
+
+    payload.merge(
+      matches_baseline: expected_sha == outcome[:normalized_response_sha256],
+      matched_request_key:,
+      expected_normalized_response_sha256: expected_sha
+    )
+  end
+
+  def summary_payload(baseline_errors:, baseline_results:, probe_errors:, probe_results:, exit_code:)
+    probe_events = probe_results + probe_errors
+    all_errors = baseline_errors + probe_errors
+    expected_baseline_count = REQUEST_TEMPLATES.size * @options[:cases].size
+    unique_async_task_ids = probe_events.filter_map { |result| result[:async_task_object_id] }.uniq
+    unique_async_task_fiber_ids = probe_events.filter_map { |result| result[:async_task_fiber_object_id] }.uniq
+    unique_fiber_ids = probe_events.filter_map { |result| result[:fiber_object_id] }.uniq
+    unique_session_ids = probe_events.filter_map { |result| result[:session_object_id] }.uniq
+    baseline_mismatch_count = probe_results.count { |result| result[:matches_baseline] == false }
+    fingerprint_mismatch_count = probe_errors.count do |result|
+      result[:error_class] == "HttpxPersistentProbe::ProbeError" &&
+        result[:error_message] == "Response fingerprint did not match input"
+    end
+    mismatch_count = baseline_mismatch_count + fingerprint_mismatch_count
+    duplicate_digest_count = duplicate_digest_count(probe_results)
+    total_requests = probe_events.size
+    total_error_count = all_errors.size
+    replayed_requests = replayed_probe_requests
+    replayed_request_label_count = replayed_requests.size
+    replayed_request_total = replayed_requests.sum { |entry| entry[:repeat_count] - 1 }
+    concurrency_consistent =
+      unique_async_task_ids.size == unique_async_task_fiber_ids.size &&
+      unique_async_task_ids.size == unique_fiber_ids.size
+    concurrency_count = concurrency_consistent ? unique_async_task_ids.size : nil
+    shared_session = unique_session_ids.size == 1
+    failure_reasons = []
+
+    failure_reasons << "baseline_errors_present" if baseline_errors.any?
+    failure_reasons << "probe_errors_present" if probe_errors.any?
+    failure_reasons << "mismatches_present" if mismatch_count.positive?
+    failure_reasons << "unexpected_baseline_count(#{baseline_results.size})" if baseline_results.size != expected_baseline_count
+    failure_reasons << "unexpected_total_request_count(#{total_requests})" if total_requests != @probe_request_total
+    failure_reasons << "insufficient_unique_async_task_ids(#{unique_async_task_ids.size})" if unique_async_task_ids.size <= 1
+    failure_reasons << "insufficient_unique_async_task_fiber_ids(#{unique_async_task_fiber_ids.size})" if unique_async_task_fiber_ids.size <= 1
+    failure_reasons << "unexpected_unique_session_id_count(#{unique_session_ids.size})" if unique_session_ids.size != 1
+
+    exit_code ||= begin
+      failure_reasons.any? ? 1 : 0
+    end
+
+    {
+      event: "summary",
+      phase: "summary",
+      run_index: @current_run_index,
+      run_id: @current_run_id,
+      log_file: @current_jsonl_path,
+      httpx_debug_log_file: @current_httpx_debug_log_path,
+      profile: @options[:profile],
+      repeat: @options[:repeat],
+      client_burst_size: @options[:client_burst_size],
+      client_burst_gap_ms: @options[:client_burst_gap_ms],
+      probe_request_count: total_requests,
+      expected_probe_request_count: @probe_request_total,
+      baseline_request_count: baseline_results.size,
+      total_requests:,
+      expected_baseline_count: expected_baseline_count,
+      baseline_count: baseline_results.size,
+      baseline_error_count: baseline_errors.size,
+      concurrency_consistent:,
+      concurrency_count:,
+      unique_async_task_id_count: unique_async_task_ids.size,
+      unique_async_task_fiber_id_count: unique_async_task_fiber_ids.size,
+      unique_fiber_id_count: unique_fiber_ids.size,
+      shared_session:,
+      unique_session_id_count: unique_session_ids.size,
+      server_connection_count: @server_connection_ids.size,
+      unique_server_connection_id_count: @server_connection_ids.size,
+      unique_server_worker_slot_count: @server_worker_slots.size,
+      replayed_request_label_count:,
+      replayed_request_total:,
+      replayed_requests:,
+      mismatch_count:,
+      fingerprint_mismatch_count:,
+      baseline_mismatch_count:,
+      error_count: total_error_count,
+      error_breakdown: error_breakdown(all_errors),
+      duplicate_digest_count:,
+      failure_reasons:,
+      exit_code:
+    }
+  end
+
+  def aggregate_summary_payload(run_summaries)
+    mismatch_runs = run_summaries.count { |summary| summary[:mismatch_count].positive? }
+    fingerprint_mismatch_runs = run_summaries.count { |summary| summary[:fingerprint_mismatch_count].positive? }
+    baseline_mismatch_runs = run_summaries.count { |summary| summary[:baseline_mismatch_count].positive? }
+    replayed_request_runs = run_summaries.count { |summary| summary[:replayed_request_label_count].positive? }
+    parser_runs = run_summaries.count { |summary| summary[:error_breakdown].any? { |error| error[:error_message] == "wrong head line format" } }
+    timeout_runs = run_summaries.count { |summary| summary[:error_breakdown].any? { |error| error[:error_message] == "Timed out after 60 seconds" } }
+
+    {
+      event: "aggregate_summary",
+      phase: "summary",
+      profile: @options[:profile],
+      repeat: @options[:repeat],
+      client_burst_size: @options[:client_burst_size],
+      client_burst_gap_ms: @options[:client_burst_gap_ms],
+      total_runs: run_summaries.size,
+      mismatch_run_count: mismatch_runs,
+      fingerprint_mismatch_run_count: fingerprint_mismatch_runs,
+      baseline_mismatch_run_count: baseline_mismatch_runs,
+      replayed_request_run_count: replayed_request_runs,
+      parser_error_run_count: parser_runs,
+      timeout_run_count: timeout_runs,
+      any_failure_run_count: run_summaries.count { |summary| summary[:exit_code] != 0 },
+      run_exit_codes: run_summaries.map { |summary| summary[:exit_code] },
+      exit_code: run_summaries.any? { |summary| summary[:exit_code] != 0 } ? 1 : 0
+    }
+  end
+
+  def duplicate_digest_count(probe_results)
+    probe_results
+      .group_by { |result| result[:normalized_response_sha256] }
+      .count { |_digest, grouped_results| grouped_results.map { |result| result[:expected_request_key] }.uniq.size > 1 }
+  end
+
+  def emit_server_event(payload)
+    track_server_metrics(payload)
+    emit_event(payload)
+  end
+
+  def track_server_metrics(payload)
+    @server_metrics_mutex.synchronize do
+      @server_connection_ids << payload[:server_connection_id] if payload[:server_connection_id]
+      @server_worker_slots << payload[:server_worker_slot] if payload[:server_worker_slot]
+      track_probe_request_replay(payload)
+    end
+  end
+
+  def track_probe_request_replay(payload)
+    return unless payload[:event] == "server_request_received"
+    return unless payload[:phase] == "probe"
+    return if payload[:request_label].to_s.empty?
+
+    @server_probe_request_counts[payload[:request_label]] += 1
+    @server_probe_request_connections[payload[:request_label]] << payload[:server_connection_id] if payload[:server_connection_id]
+  end
+
+  def replayed_probe_requests
+    @server_metrics_mutex.synchronize do
+      @server_probe_request_counts
+        .select { |_request_label, count| count > 1 }
+        .map do |request_label, count|
+          {
+            request_label:,
+            repeat_count: count,
+            server_connection_ids: @server_probe_request_connections.fetch(request_label).to_a.sort
+          }
+        end
+        .sort_by { |entry| [-entry[:repeat_count], entry[:request_label]] }
+    end
+  end
+
+  def emit_event(payload)
+    line = JSON.generate({
+      timestamp: Time.now.utc.iso8601,
+      script_run_id: @script_run_id,
+      run_id: @current_run_id,
+      run_index: @current_run_index
+    }.merge(payload))
+
+    @event_queue << line
+  end
+
+  def start_event_writer
+    @event_queue = Queue.new
+    @event_writer_thread = Thread.new do
+      while (line = @event_queue.pop)
+        if @jsonl_io
+          @jsonl_io.puts(line)
+          @jsonl_io.flush
+        else
+          @stdout.puts(line)
+        end
+      end
+    end
+  end
+
+  def stop_event_writer
+    return unless @event_writer_thread
+
+    @event_queue << nil
+    @event_writer_thread.join
+  ensure
+    @event_writer_thread = nil
+    @event_queue = nil
+  end
+
+  def open_run_output(run_index)
+    @current_jsonl_path = output_path_for_run(@options[:jsonl], run_index, default_ext: ".jsonl")
+    @jsonl_io = @current_jsonl_path ? File.open(@current_jsonl_path, "w") : nil
+    @current_httpx_debug_log_path = output_path_for_run(@options[:httpx_debug_log], run_index, default_ext: ".log")
+    @httpx_debug_io = @current_httpx_debug_log_path ? File.open(@current_httpx_debug_log_path, "w") : nil
+    @httpx_debug_io.sync = true if @httpx_debug_io
+  end
+
+  def close_run_output
+    @jsonl_io&.close
+    @httpx_debug_io&.close
+  ensure
+    @jsonl_io = nil
+    @current_jsonl_path = nil
+    @httpx_debug_io = nil
+    @current_httpx_debug_log_path = nil
+  end
+
+  def output_path_for_run(path, run_index, default_ext:)
+    return unless path
+    return path if @options[:repeat] == 1
+
+    ext = File.extname(path)
+    width = [2, @options[:repeat].to_s.length].max
+    suffix = "run-#{run_index.to_s.rjust(width, '0')}"
+
+    if ext.empty?
+      "#{path}.#{suffix}#{default_ext}"
+    else
+      base = path.delete_suffix(ext)
+      "#{base}.#{suffix}#{ext}"
+    end
+  end
+
+  def print_summary(summary)
+    parts = [
+      "summary",
+      "run_index=#{summary[:run_index]}",
+      "profile=#{summary[:profile]}",
+      "burst=#{summary[:client_burst_size]}@#{summary[:client_burst_gap_ms].join(':')}",
+      "probe_requests=#{summary[:probe_request_count]}/#{summary[:expected_probe_request_count]}",
+      "baseline_requests=#{summary[:baseline_request_count]}/#{summary[:expected_baseline_count]}",
+      concurrency_summary(summary),
+      "shared_session=#{summary[:shared_session] ? 'yes' : 'no'}",
+      "server_connections=#{summary[:server_connection_count]}",
+      mismatch_summary(summary),
+      "errors=#{summary[:error_count]}"
+    ]
+    parts << "replays=#{summary[:replayed_request_label_count]}(+#{summary[:replayed_request_total]})" if summary[:replayed_request_label_count].positive?
+    parts << "duplicate_digests=#{summary[:duplicate_digest_count]}" if summary[:duplicate_digest_count].positive?
+    parts << "exit_code=#{summary[:exit_code]}"
+    parts << "log_file=#{summary[:log_file]}" if summary[:log_file]
+    parts << "httpx_log_file=#{summary[:httpx_debug_log_file]}" if summary[:httpx_debug_log_file]
+    @stdout.puts(parts.join(" "))
+
+    print_summary_invariant_details(summary)
+
+    unless summary[:failure_reasons].empty?
+      @stdout.puts("failure_reasons: #{summary[:failure_reasons].join(', ')}")
+    end
+
+    unless summary[:replayed_requests].empty?
+      @stdout.puts("replayed_requests:")
+      summary[:replayed_requests].each do |entry|
+        @stdout.puts(
+          "  request_label=#{entry[:request_label]} " \
+          "repeat_count=#{entry[:repeat_count]} " \
+          "server_connection_ids=#{entry[:server_connection_ids].join(',')}"
+        )
+      end
+    end
+
+    return if summary[:error_breakdown].empty?
+
+    @stdout.puts("error_breakdown:")
+    summary[:error_breakdown].each do |error|
+      request_labels = error[:request_labels].join(", ")
+      @stdout.puts(
+        "  count=#{error[:count]} phase=#{error[:phase]} " \
+        "error_class=#{error[:error_class]} " \
+        "error_message=#{error[:error_message].inspect} " \
+        "request_labels=#{request_labels}"
+      )
+    end
+  end
+
+  def concurrency_summary(summary)
+    return "concurrency=#{summary[:concurrency_count]}" if summary[:concurrency_consistent]
+
+    "concurrency=mixed"
+  end
+
+  def mismatch_summary(summary)
+    return "mismatches=0" if summary[:mismatch_count].zero?
+
+    "mismatches=#{summary[:mismatch_count]}(fingerprint=#{summary[:fingerprint_mismatch_count]} baseline=#{summary[:baseline_mismatch_count]})"
+  end
+
+  def print_summary_invariant_details(summary)
+    if summary[:probe_request_count] != summary[:expected_probe_request_count]
+      @stdout.puts(
+        "probe_request_detail: actual=#{summary[:probe_request_count]} " \
+        "expected=#{summary[:expected_probe_request_count]}"
+      )
+    end
+
+    if summary[:baseline_request_count] != summary[:expected_baseline_count]
+      @stdout.puts(
+        "baseline_request_detail: actual=#{summary[:baseline_request_count]} " \
+        "expected=#{summary[:expected_baseline_count]}"
+      )
+    end
+
+    return if summary[:concurrency_consistent] && summary[:shared_session]
+
+    unless summary[:concurrency_consistent]
+      @stdout.puts(
+        "concurrency_detail: async_task_ids=#{summary[:unique_async_task_id_count]} " \
+        "async_task_fibers=#{summary[:unique_async_task_fiber_id_count]} " \
+        "fibers=#{summary[:unique_fiber_id_count]}"
+      )
+    end
+
+    unless summary[:shared_session]
+      @stdout.puts("session_detail: unique_session_id_count=#{summary[:unique_session_id_count]}")
+    end
+  end
+
+  def print_aggregate_summary(summary)
+    parts = [
+      "aggregate_summary",
+      "total_runs=#{summary[:total_runs]}",
+      "profile=#{summary[:profile]}",
+      "burst=#{summary[:client_burst_size]}@#{summary[:client_burst_gap_ms].join(':')}",
+      "mismatch_runs=#{summary[:mismatch_run_count]}(fingerprint=#{summary[:fingerprint_mismatch_run_count]} baseline=#{summary[:baseline_mismatch_run_count]})",
+      "replay_runs=#{summary[:replayed_request_run_count]}",
+      "parser_runs=#{summary[:parser_error_run_count]}",
+      "timeout_runs=#{summary[:timeout_run_count]}",
+      "failure_runs=#{summary[:any_failure_run_count]}",
+      "exit_code=#{summary[:exit_code]}"
+    ]
+    @stdout.puts(parts.join(" "))
+  end
+
+  def reset_server_metrics!
+    @server_metrics_mutex.synchronize do
+      @server_connection_ids.clear
+      @server_worker_slots.clear
+      @server_probe_request_counts.clear
+      @server_probe_request_connections.clear
+    end
+  end
+
+  def elapsed_ms(started_at)
+    ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at) * 1000).round(3)
+  end
+
+  def current_async_task
+    Async::Task.current?
+  end
+
+  def serialize_error_response_body(parsed_body:, raw_response_body:)
+    return normalize_json(parsed_body) unless parsed_body.nil?
+    return raw_response_body unless raw_response_body.nil?
+
+    nil
+  end
+
+  def error_breakdown(errors)
+    errors
+      .group_by { |error| [error[:phase], error[:error_class], error[:error_message]] }
+      .map do |(phase, error_class, error_message), grouped_errors|
+        {
+          count: grouped_errors.size,
+          phase:,
+          error_class: error_class || "UnknownError",
+          error_message: error_message || "[missing error message]",
+          request_labels: grouped_errors
+            .filter_map { |error| error[:request_label] }
+            .uniq
+            .first(ERROR_REQUEST_SAMPLE_LIMIT)
+        }
+      end
+      .sort_by { |error| [-error[:count], error[:phase], error[:error_class], error[:error_message]] }
+      .first(ERROR_SAMPLE_LIMIT)
+  end
+end
+
+exit(HttpxPersistentProbe.new(ARGV).run)
