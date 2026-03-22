@@ -2,7 +2,7 @@
 
 `bin/httpx_persistent_probe` is a self-contained reproduction harness for investigating possible `httpx` issues when many same-host requests run concurrently on different fibers through one shared persistent session.
 
-It does not boot Rails or use app code. Instead, it:
+It:
 
 - starts a local `WEBrick` server on `127.0.0.1`
 - sends requests through one shared persistent `HTTPX` session for the probe phase
